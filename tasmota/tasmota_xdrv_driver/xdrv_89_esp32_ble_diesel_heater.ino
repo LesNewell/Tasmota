@@ -105,7 +105,7 @@ number would be misleading, so it's omitted rather than shown).
 
 #if CONFIG_IDF_TARGET_ESP32 || CONFIG_IDF_TARGET_ESP32C2 || CONFIG_IDF_TARGET_ESP32C3 || CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C6 || CONFIG_IDF_TARGET_ESP32S3 || CONFIG_IDF_TARGET_ESP32P4
 #ifdef USE_BLE_DIESEL_HEATER
-#ifdef ESP32                       // ESP32 only. Use define USE_HM10 for ESP8266 support
+#ifdef ESP32                       // ESP32 only - no ESP8266 equivalent for this driver
 #ifdef USE_BLE_ESP32
 
 #define XDRV_89                    89
