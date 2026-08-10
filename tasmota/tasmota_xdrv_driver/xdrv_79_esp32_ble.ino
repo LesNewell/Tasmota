@@ -156,6 +156,16 @@ i.e. the Bluetooth of the ESP can be shared without conflict.
 #include <string.h>
 #include <cstdarg>
 
+// esp-nimble-cpp is wired in via lib_extra_dirs (a PlatformIO library), not as a registered
+// ESP-IDF component, so its own Kconfig - which would normally derive this from
+// CONFIG_BT_NIMBLE_ENABLED - never gets processed, and sdkconfig.defaults already setting it
+// has no effect. Define it directly so NimBLEDevice.h selects ESP-IDF's own nimble host
+// include path (<host/ble_gap.h>) instead of the standalone-managed-component one
+// (<nimble/nimble/host/include/host/ble_gap.h>), which doesn't exist in this build.
+#ifndef CONFIG_NIMBLE_CPP_IDF
+#define CONFIG_NIMBLE_CPP_IDF
+#endif
+
 #include <NimBLEDevice.h>
 #include <NimBLEAdvertisedDevice.h>
 // #include "NimBLEEddystoneURL.h"
