@@ -182,6 +182,15 @@ struct dh_state_t {
   uint8_t automaticHeating;
 };
 
+// explicit prototypes: Arduino/PlatformIO's auto-prototype generator scans the concatenated
+// source and inserts forward declarations near the top of the file, before HeaterClass/dh_state_t
+// are defined and without reliably tracking namespace/preprocessor-guard context - since these two
+// functions use locally-defined types directly in their signature (unlike anything in xdrv_85, the
+// pattern this file is modeled on), it generates a broken prototype unless one already exists here
+// for it to find instead.
+HeaterClass DHDetectClass(const uint8_t *raw, uint8_t len);
+bool DHParseResponse(const uint8_t *raw, uint8_t len, dh_state_t &st);
+
 HeaterClass DHDetectClass(const uint8_t *raw, uint8_t len) {
   if (len < 2) return HC_UNKNOWN;
   switch (raw[1]) {
