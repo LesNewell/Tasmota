@@ -166,6 +166,14 @@ i.e. the Bluetooth of the ESP can be shared without conflict.
 #define CONFIG_NIMBLE_CPP_IDF
 #endif
 
+#if CONFIG_IDF_TARGET_ESP32P4
+// P4 has no on-chip BT/BLE radio; BLE goes over ESP-Hosted to the C6 co-processor.
+// Since ESP-Hosted-MCU v2.5.2 the co-processor's BT controller is disabled by
+// default and must be explicitly brought up before the NimBLE host stack inits,
+// or NimBLEDevice::init() hangs waiting for a controller that's never enabled.
+#include "esp_hosted.h"
+#endif
+
 #include <NimBLEDevice.h>
 #include <NimBLEAdvertisedDevice.h>
 // #include "NimBLEEddystoneURL.h"
@@ -215,6 +223,11 @@ namespace BLE_ESP32 {
 #define GEN_STATE_WAITINDICATE 6
 
 #define GEN_STATE_NOTIFIED 7
+
+// like GEN_STATE_START, but the client is already connected (set by a chainnextcallback that
+// wants another write+wait round on the SAME connection instead of finishing/disconnecting) -
+// see chainnextcallback on generic_sensor_t.
+#define GEN_STATE_CONTINUE 8
 
 
 // Errors are all base on 0x100
@@ -271,6 +284,22 @@ struct generic_sensor_t {
 
   void *completecallback; // OPCOMPLETE_CALLBACK function, used by external drivers
   void *context; // opaque context, used by external drivers, or can be set to a long for MQTT
+
+  // optional NOTIFYACCEPT_CALLBACK: called from BLEGenNotifyCB (operation task context) right
+  // after dataNotify/notifylen are updated for each notify received. Return true to accept this
+  // notify as final (normal/default behavior, used when null); return false to keep waiting for
+  // a further notify - needed by devices that push a short ack before the real payload. Normally
+  // null; only set this if a device is known to do that (see xdrv_89's Hcalory MVP2 use).
+  void *notifyacceptcallback;
+
+  // optional CHAINNEXT_CALLBACK: called from the operation task, once per accepted notify (or
+  // once a no-notify write/read finishes), right before the framework would normally finalize
+  // and disconnect. Given a chance to inspect dataNotify/notifylen and, if it wants another
+  // write+wait round on the SAME still-open connection, overwrite dataToWrite/writelen (and
+  // optionally notifyacceptcallback, for the next round) and return true. Return false (or leave
+  // null) for normal one-shot behavior. Needed by devices whose real reply only comes after a
+  // multi-step exchange that doesn't survive a disconnect (see xdrv_89's Hcalory MVP2 use).
+  void *chainnextcallback;
 };
 
 
@@ -320,6 +349,8 @@ typedef int OPCOMPLETE_CALLBACK(BLE_ESP32::generic_sensor_t *pStruct);
 // NOTE!!!: this callback is called DIRECTLY from the operation task, so be careful about cross-thread access of data
 // if is called after read, so that you can do a read/modify/write operation on a characteristic.
 typedef int READ_CALLBACK(BLE_ESP32::generic_sensor_t *pStruct);
+typedef bool NOTIFYACCEPT_CALLBACK(BLE_ESP32::generic_sensor_t *pStruct);
+typedef bool CHAINNEXT_CALLBACK(BLE_ESP32::generic_sensor_t *pStruct);
 
 typedef int SCANCOMPLETE_CALLBACK(NimBLEScanResults results);
 
@@ -1609,6 +1640,16 @@ static void BLEGenNotifyCB(NimBLERemoteCharacteristic* pRemoteCharacteristic, ui
   } else {
     thisop->notifytruncated = 0;
   }
+
+  if (thisop->notifyacceptcallback){
+    NOTIFYACCEPT_CALLBACK *pFn = (NOTIFYACCEPT_CALLBACK *)(thisop->notifyacceptcallback);
+    if (!pFn(thisop)){
+      // driver says this notify isn't the final one - keep waiting (notifytimer stays running,
+      // subject to the normal 20s timeout) rather than completing the operation now.
+      return;
+    }
+  }
+
   // we will NOT change the state here...
   // rely on thisop->notifylen as a flag notify is complete
   //thisop->state = GEN_STATE_NOTIFIED;
@@ -1748,6 +1789,19 @@ static void BLETaskStopStartNimBLE(NimBLEClient **ppClient, bool start = true){
   BLERunningScan = 0;
 
   if (start){
+#if CONFIG_IDF_TARGET_ESP32P4
+    // one-time bring-up of the co-processor's BT controller (see include comment above)
+    static bool hostedBtControllerReady = false;
+    if (!hostedBtControllerReady){
+      if (ESP_OK != esp_hosted_bt_controller_init()){
+        AddLog(LOG_LEVEL_ERROR, PSTR("BLE: failed to init hosted BT controller"));
+      }
+      if (ESP_OK != esp_hosted_bt_controller_enable()){
+        AddLog(LOG_LEVEL_ERROR, PSTR("BLE: failed to enable hosted BT controller"));
+      }
+      hostedBtControllerReady = true;
+    }
+#endif
     AddLog(LOG_LEVEL_INFO, PSTR("BLE: BLETask: Starting NimBLE"));
     NimBLEDevice::init("BLE_ESP32");
 
@@ -1817,6 +1871,23 @@ int BLETaskStartScan(int time){
   return 0;
 }
 
+// consults op->chainnextcallback (if set). If it wants another write+wait round on the same
+// still-open connection, resets the op to continue instead of finalizing, and returns true -
+// caller must NOT finalize/disconnect in that case. Returns false for normal one-shot behavior.
+static bool BLETaskTryChainNext(BLE_ESP32::generic_sensor_t *op){
+  if (!op->chainnextcallback) return false;
+  CHAINNEXT_CALLBACK *pFn = (CHAINNEXT_CALLBACK *)(op->chainnextcallback);
+  if (!pFn(op)) return false;
+
+#ifdef BLE_ESP32_DEBUG
+  AddLog(BLELogLevel[LOG_LEVEL_DEBUG], PSTR("BLE: BLETask: chaining to another round on same connection"));
+#endif
+  op->notifylen = 0;
+  op->notifytimer = 0L;
+  op->state = GEN_STATE_CONTINUE;
+  return true;
+}
+
 // this runs one operation
 // if the passed pointer is empty, it tries to get a next one.
 static void BLETaskRunCurrentOperation(BLE_ESP32::generic_sensor_t** pCurrentOperation, NimBLEClient **ppClient){
@@ -1863,6 +1934,7 @@ static void BLETaskRunCurrentOperation(BLE_ESP32::generic_sensor_t** pCurrentOpe
     case GEN_STATE_WAITINDICATE:
     case GEN_STATE_WAITNOTIFY:
       //(*pCurrentOperation)->notifytimer == 0 at this point, so must be done
+      if (BLETaskTryChainNext(*pCurrentOperation)) return;
       (*pCurrentOperation)->state = GEN_STATE_NOTIFIED;
       // just stay here until this is removed by the main thread
 #ifdef BLE_ESP32_DEBUG
@@ -1875,6 +1947,7 @@ static void BLETaskRunCurrentOperation(BLE_ESP32::generic_sensor_t** pCurrentOpe
     case GEN_STATE_READDONE:
     case GEN_STATE_WRITEDONE:
     case GEN_STATE_NOTIFIED: // - may have completed DURING our read/write to get here
+      if (BLETaskTryChainNext(*pCurrentOperation)) return;
       // just stay here until this is removed by the main thread
 #ifdef BLE_ESP32_DEBUG
       AddLog(BLELogLevel[LOG_LEVEL_DEBUG], PSTR("BLE: BLETask: operation complete"));
@@ -1885,7 +1958,8 @@ static void BLETaskRunCurrentOperation(BLE_ESP32::generic_sensor_t** pCurrentOpe
       break;
 
     case GEN_STATE_START:
-      // continue to start the process here.
+    case GEN_STATE_CONTINUE:
+      // continue to start (or, for CONTINUE, resume on the already-open connection) below.
       break;
 
     default:
@@ -1904,12 +1978,15 @@ static void BLETaskRunCurrentOperation(BLE_ESP32::generic_sensor_t** pCurrentOpe
     return;
   }
 
-  if ((*pCurrentOperation)->state != GEN_STATE_START){
+  bool continuing = (GEN_STATE_CONTINUE == (*pCurrentOperation)->state);
+  if (!continuing && (GEN_STATE_START != (*pCurrentOperation)->state)){
     return;
   }
 
-  if (pClient->isConnected()){
-    // don't do anything if we are still connected
+  if (!continuing && pClient->isConnected()){
+    // don't do anything if we are still connected (some OTHER, stale connection - a chained
+    // continuation is expected to still be connected, and is handled by the connect() call
+    // below, which is a no-op/quick-success when already connected to this same address)
 #ifdef BLE_ESP32_DEBUG
     AddLog(LOG_LEVEL_DEBUG, PSTR("BLE: BLETask: still connected"));
 #endif
@@ -1943,13 +2020,17 @@ static void BLETaskRunCurrentOperation(BLE_ESP32::generic_sensor_t** pCurrentOpe
     return;
   }
 
-  if (pClient->connect(op->addr, true)) {
+  if (pClient->isConnected() || pClient->connect(op->addr, true)) {
 
     // as soon as connected, start another scan if possible
     BLE_ESP32::BLETaskStartScan(20);
 
 #ifdef BLE_ESP32_DEBUG
-    AddLog(BLELogLevel[LOG_LEVEL_DEBUG], PSTR("BLE: connected %s -> getservice"), ((std::string)op->addr).c_str());
+    if (continuing) {
+      AddLog(BLELogLevel[LOG_LEVEL_DEBUG], PSTR("BLE: chained round on existing connection"));
+    } else {
+      AddLog(BLELogLevel[LOG_LEVEL_DEBUG], PSTR("BLE: connected %s -> getservice, MTU %u"), ((std::string)op->addr).c_str(), pClient->getMTU());
+    }
 #endif
     NimBLERemoteService *pService = pClient->getService(op->serviceUUID);
     int waitNotify = false;
@@ -2475,6 +2556,8 @@ int newOperation(BLE_ESP32::generic_sensor_t** op){
   o->readmodifywritecallback = nullptr; // READ_CALLBACK function, used by external drivers
   o->completecallback = nullptr; // OPCOMPLETE_CALLBACK function, used by external drivers
   o->context = nullptr; // opaque context, used by external drivers, or can be set to a long for MQTT
+  o->notifyacceptcallback = nullptr; // NOTIFYACCEPT_CALLBACK function, used by external drivers
+  o->chainnextcallback = nullptr; // CHAINNEXT_CALLBACK function, used by external drivers
 
   (*op) = o;
   return 1;
