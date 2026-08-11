@@ -48,6 +48,16 @@ DieselHeaterAuto  <mac> [ON|OFF]    - automatic start/stop. AA55-family sends th
                                        this compares against the last known state and only
                                        sends the toggle when it actually needs to change (see
                                        "Caching" below - this needs a cached state to work from).
+DieselHeaterPassword <mac> [0..9999] - Hcalory MVP2 only: PIN sent on the device's next password
+                                       handshake (every operation re-sends it - see "Protocol
+                                       detection" below on why there's no persistent connection to
+                                       piggyback an already-authenticated session on). Doesn't
+                                       touch the wire itself.
+DieselHeaterError <mac> [<code>]    - error state, from cache (like the other query commands -
+                                       never touches the wire on its own). <code> true/on/1
+                                       returns the raw numeric code; omitted or anything else
+                                       (including false/off/0) returns the description string
+                                       (empty when there's no error) - see DHErrorDescription.
 
 <mac> accepts a raw hex address or a BLE_ESP32 alias (BLEAlias <mac>=<name>). The first command
 referencing a MAC registers it for periodic polling.
@@ -67,10 +77,13 @@ Caching: a query (no value given) always answers from the last cached status, ne
 fresh wire read - only DieselHeaterState does that, and the automatic periodic poll. This is
 deliberate: reading status is one combined operation returning many fields at once on both
 protocols, so per-field wire reads would be wasteful, and issuing several query commands in
-quick succession (e.g. from a script) shouldn't each open a new BLE connection. Write commands
-are not yet rate-limited/coalesced beyond the existing operation queue's one-at-a-time
-serialization - real throttling needs real hardware to know what's actually necessary, so it's
-deferred until this has been tested.
+quick succession (e.g. from a script) shouldn't each open a new BLE connection.
+
+Write coalescing: repeating the same set-command for the same device (e.g. a GUI slider firing
+several DieselHeaterLevel calls as it's dragged) while an earlier call for that same command is
+still queued updates that pending call's value in place rather than opening a separate BLE
+connection for every intermediate value - see DHQueueOp. Only the most recent value survives;
+DieselHeaterState/the automatic poll are unaffected (always a fresh read, per above).
 
 Responses (stat/<topic>/DieselHeater/<mac>):
 {
@@ -88,7 +101,8 @@ Responses (stat/<topic>/DieselHeater/<mac>):
   "CaseTemp":45,
   "CabinTemp":22,
   "TempUnit":0,
-  "ErrorCode":0
+  "ErrorCode":0,
+  "ErrorText":""
 }
 "SetTemp" or "SetLevel" appears depending on RunningMode, and neither appears when the heater is
 off/turning-off/in-error (the value is meaningless in that state on both protocols - a stale
@@ -123,6 +137,8 @@ void CmndDieselHeaterMode(void);
 void CmndDieselHeaterTemp(void);
 void CmndDieselHeaterLevel(void);
 void CmndDieselHeaterAuto(void);
+void CmndDieselHeaterPassword(void);
+void CmndDieselHeaterError(void);
 
 const char kDieselHeaterCommands[] = D_CMND_DIESELHEATER"|"
   "Period|"
@@ -131,7 +147,9 @@ const char kDieselHeaterCommands[] = D_CMND_DIESELHEATER"|"
   "Mode|"
   "Temp|"
   "Level|"
-  "Auto";
+  "Auto|"
+  "Password|"
+  "Error";
 
 void (*const DieselHeaterCommands[])(void) = {
   &CmndDieselHeaterPeriod,
@@ -141,6 +159,8 @@ void (*const DieselHeaterCommands[])(void) = {
   &CmndDieselHeaterTemp,
   &CmndDieselHeaterLevel,
   &CmndDieselHeaterAuto,
+  &CmndDieselHeaterPassword,
+  &CmndDieselHeaterError,
 };
 
 /*********************************************************************************************\
@@ -170,6 +190,75 @@ const char *ProtocolName(uint8_t p) {
 }
 bool IsHcalory(uint8_t p) { return (HP_HCALORY_MVP1 == p) || (HP_HCALORY_MVP2 == p); }
 bool IsAA55Family(uint8_t p) { return (p >= HP_AA55) && (p <= HP_AA66_ENC); }
+
+// Error code descriptions, cross-checked against the reference implementation's const.py
+// (ERROR_NAMES for AA55-family, HCALORY_ERROR_NAMES for Hcalory - the numeric codes are shared
+// across each family's protocol variants, only the byte offset they're read from differs, see
+// AA55ParseResponse/HCParseResponse). Not directly confirmed against real hardware - no fault
+// has been observed live - so treat these as documentation-derived, not hardware-verified.
+// Following this codebase's #ifndef D_X / #define D_X pattern (see e.g. xdrv_81's D_WEBCAM_STATE)
+// for Tasmota-translatable strings: a user_config_override.h or a proper language file entry can
+// override any of these before this file is compiled.
+#ifndef D_DIESELHEATER_AA55_ERR1
+#define D_DIESELHEATER_AA55_ERR1  "Startup failure"
+#define D_DIESELHEATER_AA55_ERR2  "Lack of fuel"
+#define D_DIESELHEATER_AA55_ERR3  "Supply voltage overrun"
+#define D_DIESELHEATER_AA55_ERR4  "Outlet sensor fault"
+#define D_DIESELHEATER_AA55_ERR5  "Inlet sensor fault"
+#define D_DIESELHEATER_AA55_ERR6  "Pulse pump fault"
+#define D_DIESELHEATER_AA55_ERR7  "Fan fault"
+#define D_DIESELHEATER_AA55_ERR8  "Ignition unit fault"
+#define D_DIESELHEATER_AA55_ERR9  "Overheating"
+#define D_DIESELHEATER_AA55_ERR10 "Overheat sensor fault"
+#endif
+
+#ifndef D_DIESELHEATER_HC_ERR1
+#define D_DIESELHEATER_HC_ERR1  "E01 - Ignition failure"
+#define D_DIESELHEATER_HC_ERR2  "E02 - Flame out"
+#define D_DIESELHEATER_HC_ERR3  "E03 - Overheat"
+#define D_DIESELHEATER_HC_ERR4  "E04 - Fan failure"
+#define D_DIESELHEATER_HC_ERR5  "E05 - Pump failure"
+#define D_DIESELHEATER_HC_ERR6  "E06 - Sensor failure"
+#define D_DIESELHEATER_HC_ERR7  "E07 - Low voltage"
+#define D_DIESELHEATER_HC_ERR8  "E08 - High voltage"
+#define D_DIESELHEATER_HC_ERR9  "E09 - Communication error"
+#define D_DIESELHEATER_HC_ERR10 "E10 - CO concentration high"
+#define D_DIESELHEATER_HC_ERR11 "E11 - CO concentration critical"
+#endif
+
+// Returns "" for no error (code 0) or an unrecognized code, matching DieselHeaterError's
+// documented "no error" contract.
+const char *DHErrorDescription(uint8_t protocol, uint8_t code) {
+  if (IsHcalory(protocol)) {
+    switch (code) {
+      case 1:  return D_DIESELHEATER_HC_ERR1;
+      case 2:  return D_DIESELHEATER_HC_ERR2;
+      case 3:  return D_DIESELHEATER_HC_ERR3;
+      case 4:  return D_DIESELHEATER_HC_ERR4;
+      case 5:  return D_DIESELHEATER_HC_ERR5;
+      case 6:  return D_DIESELHEATER_HC_ERR6;
+      case 7:  return D_DIESELHEATER_HC_ERR7;
+      case 8:  return D_DIESELHEATER_HC_ERR8;
+      case 9:  return D_DIESELHEATER_HC_ERR9;
+      case 10: return D_DIESELHEATER_HC_ERR10;
+      case 11: return D_DIESELHEATER_HC_ERR11;
+      default: return "";
+    }
+  }
+  switch (code) {
+    case 1:  return D_DIESELHEATER_AA55_ERR1;
+    case 2:  return D_DIESELHEATER_AA55_ERR2;
+    case 3:  return D_DIESELHEATER_AA55_ERR3;
+    case 4:  return D_DIESELHEATER_AA55_ERR4;
+    case 5:  return D_DIESELHEATER_AA55_ERR5;
+    case 6:  return D_DIESELHEATER_AA55_ERR6;
+    case 7:  return D_DIESELHEATER_AA55_ERR7;
+    case 8:  return D_DIESELHEATER_AA55_ERR8;
+    case 9:  return D_DIESELHEATER_AA55_ERR9;
+    case 10: return D_DIESELHEATER_AA55_ERR10;
+    default: return "";
+  }
+}
 
 // user-facing command intents - "verb" in the request builders below
 enum DHCmd : uint8_t {
@@ -262,10 +351,11 @@ bool AA55ParseResponse(const uint8_t *raw, uint8_t len, aa55_state_t &st) {
   if (dlen > 2) st.rcvCmd = decrypted[2];
   if (dlen > 3) st.runningState = decrypted[3];
 
-  if ((HP_AA55 == hc || HP_AA55_ENC == hc) && dlen > 4) {
+  // AA66 (unencrypted) error code offset was wrongly 17 - cross-checked against the reference
+  // implementation's ProtocolAA55/AA66/AA55Encrypted/AA66Encrypted classes: AA55, AA66 and AA55
+  // encrypted all read the error code from byte 4; only AA66 encrypted differs (byte 35).
+  if ((HP_AA55 == hc || HP_AA66 == hc || HP_AA55_ENC == hc) && dlen > 4) {
     st.errCode = decrypted[4];
-  } else if (HP_AA66 == hc && dlen > 17) {
-    st.errCode = decrypted[17];
   } else if (HP_AA66_ENC == hc && dlen > 35) {
     st.errCode = decrypted[35];
   }
@@ -478,7 +568,7 @@ uint8_t HCBuildMvp2QueryCmd(uint8_t *buf) {
 // MVP2 password handshake: 00 02 00 01 00 01 00 0A 0C 00 00 05 01 [D1 D2 D3 D4] [checksum]
 // PIN not currently exposed as a command - hardcoded to the reference implementation's own
 // default of 1234, which is also the factory-default PIN on an unconfigured heater.
-uint8_t HCBuildPasswordHandshake(uint8_t *buf, uint16_t passkey = 1234) {
+uint8_t HCBuildPasswordHandshake(uint8_t *buf, uint16_t passkey = 0) {
   buf[0] = 0x00; buf[1] = 0x02;
   buf[2] = 0x00; buf[3] = 0x01;
   buf[4] = 0x00; buf[5] = 0x01;
@@ -505,7 +595,11 @@ uint8_t HCBuildPasswordHandshake(uint8_t *buf, uint16_t passkey = 1234) {
 
 #define DIESELHEATER_NUM_DEVICESLOTS 4
 #define DIESELHEATER_RETRIES 4
-#define DIESELHEATER_FRAME_MAX 18 // largest of the AA55 (8) and Hcalory (18) frame shapes
+// largest of the AA55 (8), Hcalory password handshake (18), and Hcalory HC_CMD_POWER frame
+// shapes (12-byte header + 9-byte payload + 1-byte checksum = 22) - was wrongly 18 (a real stack
+// buffer overflow: every POWER/STATE/MODE/AUTO frame on Hcalory overran this by 4 bytes,
+// corrupting the query byte and checksum on every single one of those commands).
+#define DIESELHEATER_FRAME_MAX 22
 
 struct dh_device_tag {
   uint8_t addr[7];
@@ -513,6 +607,10 @@ struct dh_device_tag {
   uint8_t protocol;   // HeaterProtocol - HP_UNKNOWN until the detection cascade confirms it
   int8_t RSSI;
   bool stateValid;
+  uint16_t hcaloryPasskey; // Hcalory MVP2 only - PIN used to seed the first verify attempt of a
+                           // chained op (see DHMvp2ChainCallback), set via DieselHeaterPassword;
+                           // 0 (the zero-init default) is itself a real PIN some devices use, not
+                           // a "no PIN" sentinel.
   union {
     aa55_state_t aa55;
     hc_state_t hcalory;
@@ -626,12 +724,11 @@ uint8_t BuildFrame(uint8_t protocolCandidate, uint8_t cmd, int argument, const d
   if (IsHcalory(protocolCandidate)) {
     switch (cmd) {
       case DHCMD_PASSWORD:
-        return HCBuildPasswordHandshake(buf);
+        return HCBuildPasswordHandshake(buf, dev ? dev->hcaloryPasskey : 0);
       case DHCMD_POLL:
       case DHCMD_STATE: {
-        if (HP_HCALORY_MVP2 == protocolCandidate) {
-          return HCBuildMvp2QueryCmd(buf);
-        }
+        // Real capture evidence (issue #34): 0x0A0A is time-sync only - the actual full status
+        // reply on MVP2 comes from the same 0x0E04 query MVP1 uses, not from 0x0A0A.
         uint8_t payload[9] = {0,0,0,0,0,0,0,0, HC_POWER_QUERY};
         return HCBuildCmd(buf, HC_CMD_POWER, payload, sizeof(payload));
       }
@@ -696,11 +793,77 @@ void UUIDsFor(uint8_t protocol, const char **svc, const char **writeChar, const 
 int DHGenericOpCompleteFn(BLE_ESP32::generic_sensor_t *pStruct);
 void DHPublishNoOp(const uint8_t *addr, const char *cmdName);
 void DHPublish(const uint8_t *addr, const char *cmdName, bool success);
+bool DHNotifyAcceptMvp2Status(BLE_ESP32::generic_sensor_t *op);
+bool DHMvp2ChainCallback(BLE_ESP32::generic_sensor_t *op);
+
+// Hcalory MVP2 pushes a short (~19 byte) ack notify before the real status notify - the ack
+// alone isn't enough for HCParseResponse (needs 38+ bytes), so for status queries we tell the
+// BLE framework to keep waiting rather than accept the first (ack) notify as final.
+bool DHNotifyAcceptMvp2Status(BLE_ESP32::generic_sensor_t *op) {
+  return op->notifylen >= 38;
+}
+
+// Scratch state for the in-flight MVP2 chained op (verify -> real command, one connection).
+// A single file-static instance matches this framework's current one-op-in-flight-at-a-time
+// model (see BLEOperationTask) - if that ever changes, this needs to move to per-op storage.
+// Deliberately holds NO pointers into dh_device_tag/opQueue: DHMvp2ChainCallback runs on the BLE
+// task thread, not the main thread, so it must not touch driver state those are read/written
+// from (see DHQueueOp's comment on why chaining exists at all).
+struct {
+  uint8_t stage;             // 0 = verifying password, 1 = real command sent
+  uint8_t realFrame[DIESELHEATER_FRAME_MAX];
+  uint8_t realFrameLen;
+  uint8_t verifyAttempts;
+} dhChain;
+
+// chainnextcallback for the MVP2 flow - see the comment on chainnextcallback in xdrv_79 for the
+// contract. Called on the BLE task thread right after each accepted notify.
+bool DHMvp2ChainCallback(BLE_ESP32::generic_sensor_t *op) {
+  if (0 == dhChain.stage) {
+    // this is the heater's password-announce/verify-response notify (see file header "Protocol
+    // detection") - too short to be anything else is treated the same as "not authenticated yet".
+    if (op->notifylen >= 18 && 1 == op->dataNotify[17]) {
+      // authenticated - send the real command next, and now require a real (38+ byte) reply.
+      memcpy(op->dataToWrite, dhChain.realFrame, dhChain.realFrameLen);
+      op->writelen = dhChain.realFrameLen;
+      op->notifyacceptcallback = (void *)DHNotifyAcceptMvp2Status;
+      dhChain.stage = 1;
+      return true;
+    }
+    // not authenticated - learn the password the heater just told us and re-verify with it.
+    // Bounded so a malformed/stuck exchange still finishes (as a failure) instead of looping.
+    const uint8_t *n = op->dataNotify;
+    if (dhChain.verifyAttempts >= 5 || op->notifylen < 18
+        || n[13] > 9 || n[14] > 9 || n[15] > 9 || n[16] > 9) {
+      return false; // give up chaining - finishes/reports normally with whatever we have
+    }
+    uint16_t learned = (uint16_t)(n[13] * 1000 + n[14] * 100 + n[15] * 10 + n[16]);
+    op->writelen = HCBuildPasswordHandshake(op->dataToWrite, learned);
+    dhChain.verifyAttempts++;
+    return true;
+  }
+  // stage 1: notifyacceptcallback already required this to be a real (38+ byte) reply - done.
+  return false;
+}
 
 bool DHOperation(const uint8_t *MAC, uint8_t cmd, int argument, uint8_t protocolCandidate, const dh_device_tag *dev) {
   uint8_t frame[DIESELHEATER_FRAME_MAX];
-  uint8_t frameLen = BuildFrame(protocolCandidate, cmd, argument, dev, frame);
-  if (0 == frameLen) return false; // not supported / no-op (e.g. auto toggle already in desired state)
+  uint8_t frameLen;
+  // MVP2 needs the chained verify-then-real-command flow (see DHQueueOp/DHMvp2ChainCallback) for
+  // every real command; DHCMD_PASSWORD itself (no longer queued externally, but BuildFrame still
+  // supports it) stays a plain one-shot op.
+  bool chained = (HP_HCALORY_MVP2 == protocolCandidate) && (DHCMD_PASSWORD != cmd);
+
+  if (chained) {
+    dhChain.stage = 0;
+    dhChain.verifyAttempts = 0;
+    dhChain.realFrameLen = BuildFrame(protocolCandidate, cmd, argument, dev, dhChain.realFrame);
+    if (0 == dhChain.realFrameLen) return false; // not supported / no-op for this cmd
+    frameLen = HCBuildPasswordHandshake(frame, dev ? dev->hcaloryPasskey : 0);
+  } else {
+    frameLen = BuildFrame(protocolCandidate, cmd, argument, dev, frame);
+    if (0 == frameLen) return false; // not supported / no-op (e.g. auto toggle already in desired state)
+  }
 
   BLE_ESP32::generic_sensor_t *op = nullptr;
   int res = BLE_ESP32::newOperation(&op);
@@ -724,6 +887,10 @@ bool DHOperation(const uint8_t *MAC, uint8_t cmd, int argument, uint8_t protocol
   op->completecallback = (void *)DHGenericOpCompleteFn;
   // pack cmd (low byte), protocol candidate tried (next byte), and argument (top 16 bits) into context
   op->context = (void *)(uint32_t)(cmd | ((uint32_t)protocolCandidate << 8) | ((uint32_t)(uint16_t)argument << 16));
+
+  if (chained) {
+    op->chainnextcallback = (void *)DHMvp2ChainCallback;
+  }
 
   res = BLE_ESP32::extQueueOperation(&op);
   if (!res) {
@@ -771,19 +938,33 @@ int DHDoOp() {
 }
 
 int DHQueueOp(const uint8_t *MAC, uint8_t cmd, int argument) {
-  dh_device_tag *dev = findOrRegisterDevice(MAC);
   // MVP2's password handshake can't be sent once per session (BLETaskRunTaskDoneOperation
   // disconnects after every single operation, confirmed by reading it - there's no persistent
-  // connection to piggyback on), so it's queued fresh ahead of every command whenever the
-  // target might be MVP2 (confirmed MVP2, or not yet identified at all).
-  bool mightBeMvp2 = !dev || (HP_UNKNOWN == dev->protocol) || (HP_HCALORY_MVP2 == dev->protocol);
-  if (mightBeMvp2 && DHCMD_PASSWORD != cmd) {
-    op_t* pwop = new op_t;
-    memcpy(pwop->addr, MAC, 6);
-    pwop->cmd = DHCMD_PASSWORD;
-    pwop->argument = 0;
-    pwop->protocolTried = HP_UNKNOWN;
-    opQueue.push_back(pwop);
+  // connection to piggyback on) AND authentication itself doesn't survive a disconnect either
+  // (confirmed live: a separate pre-op password op authenticates fine, but the next op's fresh
+  // connection comes back unauthenticated again). So for the MVP2 candidate specifically,
+  // DHOperation builds a single chained op instead - verify (learning the password from the
+  // heater's own announcement if needed) then the real command, all on one connection. See
+  // DHMvp2ChainCallback.
+
+  // Coalesce rapid repeats of the same set-command for the same device (e.g. a GUI slider
+  // firing several DieselHeaterLevel calls as it's dragged) into the still-pending queue entry,
+  // instead of opening a separate BLE connection for every intermediate value. STATE/POLL/
+  // PASSWORD are excluded - DieselHeaterState is documented to always force a fresh read, and
+  // POLL/PASSWORD aren't user-facing set commands.
+  // opQueue[0] is skipped whenever an operation is in flight (opInProgress) - its wire frame is
+  // already built from a snapshot of argument taken at dispatch time, so mutating it now
+  // wouldn't reach the heater; opInProgress==0 implies opQueue is empty (DHDoOp dispatches
+  // synchronously on every push/pop), so this is only ever a no-op in that case, not unsafe.
+  bool coalescible = (DHCMD_STATE != cmd) && (DHCMD_POLL != cmd) && (DHCMD_PASSWORD != cmd);
+  if (coalescible) {
+    for (size_t i = (opInProgress ? 1 : 0); i < opQueue.size(); i++) {
+      if (!memcmp(opQueue[i]->addr, MAC, 6) && opQueue[i]->cmd == cmd) {
+        opQueue[i]->argument = argument;
+        AddLog(LOG_LEVEL_DEBUG, PSTR("DHT: %s: coalesced \"%s\" into pending op"), addrStr(MAC), cmdnames[cmd]);
+        return opQueue.size();
+      }
+    }
   }
 
   op_t* newop = new op_t;
@@ -843,6 +1024,7 @@ void DHPublish(const uint8_t *addr, const char *cmdName, bool success) {
         ResponseAppend_P(PSTR(",\"CabinTemp\":%d"), st.cabTemp);
         ResponseAppend_P(PSTR(",\"TempUnit\":%d"), st.tempUnit);
         ResponseAppend_P(PSTR(",\"ErrorCode\":%d"), st.errorCode);
+        ResponseAppend_P(PSTR(",\"ErrorText\":\"%s\""), DHErrorDescription(dev->protocol, st.errorCode));
       } else {
         aa55_state_t &st = dev->state.aa55;
         ResponseAppend_P(PSTR(",\"RunningState\":%d"), st.runningState);
@@ -858,6 +1040,7 @@ void DHPublish(const uint8_t *addr, const char *cmdName, bool success) {
         ResponseAppend_P(PSTR(",\"CaseTemp\":%d"), st.caseTemp);
         ResponseAppend_P(PSTR(",\"CabinTemp\":%d"), st.cabTemp);
         ResponseAppend_P(PSTR(",\"ErrorCode\":%d"), st.errCode);
+        ResponseAppend_P(PSTR(",\"ErrorText\":\"%s\""), DHErrorDescription(dev->protocol, st.errCode));
         ResponseAppend_P(PSTR(",\"Altitude\":%d"), st.altitude);
         if (st.hasExtras) {
           ResponseAppend_P(PSTR(",\"AutoStartStop\":%s"), st.isAuto ? "true" : "false");
@@ -962,6 +1145,9 @@ int DHGenericOpCompleteFn(BLE_ESP32::generic_sensor_t *op) {
     }
   }
 
+  // MVP2 password learning/verification now happens inline within one connection - see
+  // DHMvp2ChainCallback - rather than as a separate op reported through here.
+
   if (DHCMD_PASSWORD != cmd) {
     DHPublish(addrev, cmdName, true);
   }
@@ -1029,6 +1215,49 @@ void CmndDieselHeaterState(void) {
   ResponseCmndChar(responses[(res > 0) ? 1 : 0]);
 }
 
+// Hcalory MVP2 only - PIN used on the device's next password handshake. Omit the value to query
+// the currently cached PIN; give one (0-9999) to change it for this device. Doesn't itself touch
+// the wire - takes effect on the next queued operation for this MAC.
+void CmndDieselHeaterPassword(void) {
+  uint8_t addrbin[7];
+  char *rest;
+  if (!DHParseMac(addrbin, &rest)) { ResponseCmndChar(responses[2]); return; }
+
+  dh_device_tag *dev = findOrRegisterDevice(addrbin);
+  if (!dev) { ResponseCmndChar(responses[2]); return; }
+
+  if (rest && rest[0]) {
+    int pin = atoi(rest);
+    if (pin < 0) pin = 0;
+    if (pin > 9999) pin = 9999;
+    dev->hcaloryPasskey = (uint16_t)pin;
+  }
+  ResponseCmndNumber(dev->hcaloryPasskey);
+}
+
+// DieselHeaterError <mac> [<code>] - <code> true/on/1 (case-insensitive) returns the raw
+// numeric error code; omitted or anything else (false/off/0/unrecognized) returns the
+// description (D_DIESELHEATER_* - see DHErrorDescription), empty string when there's no error.
+void CmndDieselHeaterError(void) {
+  uint8_t addrbin[7];
+  char *rest;
+  if (!DHParseMac(addrbin, &rest)) { ResponseCmndChar(responses[2]); return; }
+
+  dh_device_tag *dev = findOrRegisterDevice(addrbin);
+  if (!dev || !dev->stateValid) { ResponseCmndChar(responses[3]); return; }
+
+  bool wantCode = rest && rest[0]
+    && (!strcasecmp(rest, "true") || !strcasecmp(rest, "on") || !strcmp(rest, "1"));
+
+  uint8_t code = IsHcalory(dev->protocol) ? dev->state.hcalory.errorCode : dev->state.aa55.errCode;
+
+  if (wantCode) {
+    ResponseCmndNumber(code);
+  } else {
+    ResponseCmndChar(DHErrorDescription(dev->protocol, code));
+  }
+}
+
 // shared implementation for the query-or-set commands
 void DHQueryOrSet(uint8_t cmd, int (*parseArg)(const char *)) {
   uint8_t addrbin[7];
@@ -1047,6 +1276,25 @@ void DHQueryOrSet(uint8_t cmd, int (*parseArg)(const char *)) {
 
   int argument = parseArg(rest);
   if (argument < 0) { ResponseCmndChar(responses[2]); return; } // reusing invaddr for "bad value" too
+
+  // Hcalory MVP2 won't switch directly out of Ventilation via the mode-set command - confirmed
+  // live: it's acknowledged ("result":"ok") but has no actual effect. Power-cycling first
+  // reliably works, and - also confirmed live - turning off from Ventilation (no combustion to
+  // purge) takes effect immediately, unlike the multi-minute cooldown after actually heating, so
+  // no extra wait is needed: the existing op queue already serializes strictly one-at-a-time,
+  // and Power OFF's own response already reflects the post-off state. Only handling MVP2 here -
+  // no test evidence either way for MVP1 or AA55.
+  // Relies on DHQueueOp synchronously dispatching (via DHDoOp) whenever nothing else is in
+  // flight, and BuildFrame never failing for DHCMD_POWER on a confirmed-MVP2 device - so the
+  // "off" push below is always already dispatched (and thus skipped by write coalescing, which
+  // only scans pending/non-dispatched entries) before the "on" push is queued. If that ever
+  // stops holding, coalescing would wrongly merge these into just "on".
+  if ((DHCMD_MODE == cmd) && (0 == argument || 1 == argument) && dev && dev->stateValid
+      && (HP_HCALORY_MVP2 == dev->protocol) && (0x3 == dev->state.hcalory.setMode)) {
+    DHQueueOp(addrbin, DHCMD_POWER, 0); // off
+    DHQueueOp(addrbin, DHCMD_POWER, 1); // on
+  }
+
   int res = DHQueueOp(addrbin, cmd, argument);
   ResponseCmndChar(responses[(res > 0) ? 1 : 0]);
 }
