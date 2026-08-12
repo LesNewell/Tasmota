@@ -39,6 +39,8 @@
 #if defined(USE_FT5206) || defined(USE_XPT2046) || defined(USE_GT911) || defined(USE_LILYGO47) || defined(USE_UNIVERSAL_TOUCH) || defined(USE_TOUCH_BUTTONS) || defined(SIMPLE_RES_TOUCH)
 
 #include <renderer.h>
+#include "esp_ldo_regulator.h"
+
 
 #define XDRV_55             55
 
@@ -238,11 +240,27 @@ bool CST816S_Touch_Init(uint8_t bus, int8_t irq_pin, int8_t rst_pin, int interru
 
 
 #ifdef USE_UNIVERSAL_TOUCH
+static esp_ldo_channel_handle_t ldo4_handle = NULL;  // Handle for LDO channel 4
 
 void utouch_Touch_Init() {
   if (renderer) {
     char *name;
-    utouch_found = renderer->utouch_Init(&name);
+
+
+  esp_ldo_channel_config_t ldo_config = {
+      .chan_id = 4,
+      .voltage_mv = 3300,
+  };
+  esp_err_t ret = esp_ldo_acquire_channel(&ldo_config, &ldo4_handle);
+  if (ret != ESP_OK) {
+      AddLog(LOG_LEVEL_INFO, PSTR("UTI: Failed to acquire LDO: %d"), ret);
+      return;
+  }
+  AddLog(LOG_LEVEL_INFO, PSTR("UTI: LDO enabled (ch %d @ %dmV)"), ldo_config.chan_id, ldo_config.voltage_mv);
+
+
+
+  utouch_found = renderer->utouch_Init(&name);
     if (utouch_found) {
       AddLog(LOG_LEVEL_INFO, PSTR("UTI: %s initialized"), name);
     }
