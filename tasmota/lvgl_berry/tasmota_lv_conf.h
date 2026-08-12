@@ -178,7 +178,11 @@
      */
     #define LV_DRAW_SW_SUPPORT_RGB565       1
     #define LV_DRAW_SW_SUPPORT_RGB565_SWAPPED       0   // TASMOTA
-    #define LV_DRAW_SW_SUPPORT_RGB565A8     0       // TASMOTA
+    #ifdef ESP32
+        #define LV_DRAW_SW_SUPPORT_RGB565A8 1       // TASMOTA - ESP32 only, fixes image rotate/scale for RGB565
+    #else
+        #define LV_DRAW_SW_SUPPORT_RGB565A8 0       // TASMOTA
+    #endif
     #define LV_DRAW_SW_SUPPORT_RGB888       1
     #define LV_DRAW_SW_SUPPORT_XRGB8888     0       // TASMOTA
     #define LV_DRAW_SW_SUPPORT_ARGB8888     1
