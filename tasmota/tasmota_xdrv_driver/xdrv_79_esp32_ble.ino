@@ -386,6 +386,11 @@ static void BLEDiag();
 const char *getAlias(const uint8_t *addr);
 //void BLEAliasMqttList();
 void BLEAliasListResp();
+#ifdef BLE_ESP32_ALIASES
+void BLEAliasesLoad(void);
+void BLEAliasesSave(void);
+void BLEAliasesReset(void);
+#endif
 ////////////////////////////////////////////////////////////////////////
 // utilities
 // dump a binary to hex
@@ -2836,7 +2841,114 @@ int addAlias( uint8_t *addr, char *name){
   aliases.push_back(alias);
   return 1;
 }
-#endif
+
+/*********************************************************************************************\
+ * BLE Alias persistence - saved to file /.drvset079 (see TASM_FILE_DRIVER)
+\*********************************************************************************************/
+#define BLE_ALIASES_MAX      64      // sanity cap on number of persisted aliases
+#define BLE_ALIASES_VERSION  0x0100
+
+struct ble_aliases_header_t {
+  uint32_t crc32;
+  uint16_t version;
+  uint16_t count;
+};
+
+static uint32_t BLEAliasesCrc32 = 0;
+
+static void BLEAliasesFilename(char *filename, size_t len){
+  snprintf_P(filename, len, PSTR(TASM_FILE_DRIVER), XDRV_79);
+}
+
+void BLEAliasesLoad(void){
+#ifdef USE_UFILESYS
+  char filename[20];
+  BLEAliasesFilename(filename, sizeof(filename));
+
+  BLE_ESP32::ble_aliases_header_t header;
+  if (!TfsLoadFile(filename, (uint8_t*)&header, sizeof(header))){
+    return;   // no persisted aliases yet
+  }
+  if (!header.count || (header.count > BLE_ALIASES_MAX)){
+    return;
+  }
+
+  uint32_t buf_len = sizeof(header) + (header.count * sizeof(BLE_ESP32::ble_alias_t));
+  uint8_t *buf = (uint8_t*) malloc(buf_len);
+  if (!buf){
+    return;
+  }
+  if (TfsLoadFile(filename, buf, buf_len)){
+    uint32_t crc32 = GetCfgCrc32(buf + sizeof(uint32_t), buf_len - sizeof(uint32_t));
+    if (crc32 == header.crc32){
+      BLE_ESP32::ble_alias_t *records = (BLE_ESP32::ble_alias_t*)(buf + sizeof(header));
+      for (uint32_t i = 0; i < header.count; i++){
+        BLE_ESP32::ble_alias_t *alias = new BLE_ESP32::ble_alias_t;
+        memcpy(alias, &records[i], sizeof(BLE_ESP32::ble_alias_t));
+        alias->name[BLE_ESP32_MAXALIASLEN] = 0;
+        aliases.push_back(alias);
+      }
+      BLEAliasesCrc32 = crc32;
+      AddLog(LOG_LEVEL_INFO, PSTR("BLE: Loaded %d alias(es) from flash"), header.count);
+    } else {
+      AddLog(LOG_LEVEL_ERROR, PSTR("BLE: Alias file crc mismatch, ignoring"));
+    }
+  }
+  free(buf);
+#endif  // USE_UFILESYS
+}
+
+void BLEAliasesSave(void){
+#ifdef USE_UFILESYS
+  uint32_t count = aliases.size();
+  if (count > BLE_ALIASES_MAX){
+    AddLog(LOG_LEVEL_INFO, PSTR("BLE: Only persisting first %d of %d aliases"), BLE_ALIASES_MAX, count);
+    count = BLE_ALIASES_MAX;
+  }
+
+  uint32_t buf_len = sizeof(BLE_ESP32::ble_aliases_header_t) + (count * sizeof(BLE_ESP32::ble_alias_t));
+  uint8_t *buf = (uint8_t*) malloc(buf_len);
+  if (!buf){
+    return;
+  }
+
+  BLE_ESP32::ble_aliases_header_t *header = (BLE_ESP32::ble_aliases_header_t*) buf;
+  BLE_ESP32::ble_alias_t *records = (BLE_ESP32::ble_alias_t*)(buf + sizeof(BLE_ESP32::ble_aliases_header_t));
+  header->version = BLE_ALIASES_VERSION;
+  header->count = count;
+  for (uint32_t i = 0; i < count; i++){
+    memcpy(&records[i], aliases[i], sizeof(BLE_ESP32::ble_alias_t));
+  }
+  header->crc32 = GetCfgCrc32(buf + sizeof(uint32_t), buf_len - sizeof(uint32_t));
+
+  if (header->crc32 != BLEAliasesCrc32){
+    char filename[20];
+    BLEAliasesFilename(filename, sizeof(filename));
+    if (TfsSaveFile(filename, buf, buf_len)){
+      BLEAliasesCrc32 = header->crc32;
+      AddLog(LOG_LEVEL_DEBUG, PSTR("BLE: Saved %d alias(es) to flash"), count);
+    } else {
+      AddLog(LOG_LEVEL_DEBUG, PSTR("BLE: ERROR unable to save aliases, filesystem not ready"));
+    }
+  }
+  free(buf);
+#endif  // USE_UFILESYS
+}
+
+void BLEAliasesReset(void){
+#ifdef USE_UFILESYS
+  char filename[20];
+  BLEAliasesFilename(filename, sizeof(filename));
+  TfsDeleteFile(filename);
+#endif  // USE_UFILESYS
+  for (int i = aliases.size()-1; i >= 0; i--){
+    BLE_ESP32::ble_alias_t *alias = aliases[i];
+    aliases.pop_back();
+    delete alias;
+  }
+  BLEAliasesCrc32 = 0;
+}
+#endif  // BLE_ESP32_ALIASES
 
 /**
  * @brief Remove all colons from null terminated char array
@@ -3271,6 +3383,7 @@ void CmndBLEAlias(void){
             BLE_ESP32::ble_alias_t *alias = aliases[i];
             if (!memcmp(alias->addr, addr, 6)){
               aliases.erase(aliases.begin() + i);
+              BLEAliasesSave();
               BLEAliasListResp();
               return;
             }
@@ -3286,6 +3399,7 @@ void CmndBLEAlias(void){
       } while (p);
       if (added){
         AddLog(BLELogLevel[LOG_LEVEL_DEBUG], PSTR("BLE: Added %d Aliases"), added);
+        BLEAliasesSave();
         BLEAliasListResp();
       } else {
         BLEAliasListResp();
@@ -3294,11 +3408,7 @@ void CmndBLEAlias(void){
     } break;
     case 2:{ // clear
       AddLog(BLELogLevel[LOG_LEVEL_DEBUG], PSTR("BLE: Alias clearing %d"), aliases.size());
-      for (int i = aliases.size()-1; i >= 0; i--){
-        BLE_ESP32::ble_alias_t *alias = aliases[i];
-        aliases.pop_back();
-        delete alias;
-      }
+      BLEAliasesReset();
       BLEAliasListResp();
       return;
     } break;
@@ -4007,6 +4117,20 @@ bool Xdrv79(uint32_t function)
   //if (!Settings->flag5.mi32_enable) { return false; }  // SetOption115 - Enable ESP32 BLE BLE
 
   bool result = false;
+
+#ifdef BLE_ESP32_ALIASES
+  switch (function) {
+    case FUNC_PRE_INIT:
+      BLE_ESP32::BLEAliasesLoad();
+      break;
+    case FUNC_SAVE_SETTINGS:
+      BLE_ESP32::BLEAliasesSave();
+      break;
+    case FUNC_RESET_SETTINGS:
+      BLE_ESP32::BLEAliasesReset();
+      break;
+  }
+#endif  // BLE_ESP32_ALIASES
 
   if (FUNC_INIT == function){
     BLE_ESP32::BLEPreInit();
