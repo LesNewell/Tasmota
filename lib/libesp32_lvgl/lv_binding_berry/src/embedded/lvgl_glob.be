@@ -9,7 +9,6 @@ class LVGL_glob
   var cb_event_closure      # mapping for event closures per LVGL native pointer (int). For each int key, contains either a closure or an array with multiple closures
   var event_cb              # array of native callback for lv.lv_event (when multiple are needed)
   var timer_cb              # native callback for lv.lv_timer
-  var event                 # keep aroud the current lv_event to avoid repeated allocation
   var general_event_cb      # new simplified way to register event_cb to any widget
 
   #- below are native callbacks mapped to a closure to a method of this instance -#
@@ -70,18 +69,23 @@ class LVGL_glob
     import introspect
     var event_ptr = introspect.toptr(event_ptr_i)
 
-    # use always the same instance of lv.lv_event by changing pointer, create a new the first time
-    if self.event   self.event._p = event_ptr
-    else            self.event = lv.lv_event(event_ptr)
-    end
+    # A fresh instance per dispatch, not a shared/reused one: dispatch can
+    # re-enter (a handler here can synchronously trigger LVGL events whose
+    # dispatch calls back into this same method before the outer call has
+    # returned - e.g. LV_EVENT_CHILD_CREATED, which bubbles unconditionally
+    # to every ancestor regardless of LV_OBJ_FLAG_EVENT_BUBBLE). Reusing one
+    # instance and mutating its `_p` in place let an inner call repoint the
+    # outer call's still-live `event` out from under it. Matches the pattern
+    # `widget_event_impl` below already uses.
+    var event = lv.lv_event(event_ptr)
 
-    var target = self.event.get_target()          # LVGL native object as target of the event (comptr)
+    var target = event.get_target()               # LVGL native object as target of the event (comptr)
     var obj = self.get_object_from_ptr(target)    # get the corresponding Berry LVGL object previously recorded as its container
     var f = self.cb_event_closure[target]         # get the closure or closure list known for this object
     if type(f) == 'function'                      # if only one callback, just use it
-      f(obj, self.event)
+      f(obj, event)
     elif rank < size(f)                           # if more than one, then it's a list - use the closure for `rank`
-      f[rank](obj, self.event)
+      f[rank](obj, event)
     end
   end
 
