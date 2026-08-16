@@ -2982,7 +2982,6 @@ class HASPmota
   # regex patterns
   var re_page_target                    # compiled regex for action `p<number>`
   # specific event_cb handling for less memory usage since we are registering a lot of callbacks
-  var event                             # try to keep the event object around and reuse it
   var event_cb                          # the low-level callback for the closure to be registered
   # auto-dimming for inactivity
   var antiburn_time                     # number of minutes to perdiodically trigger antiburn for LCD
@@ -3568,16 +3567,21 @@ class HASPmota
     import introspect
     var event_ptr = introspect.toptr(event_ptr_i)   # convert to comptr, because it was a pointer in the first place
 
-    if self.event   self.event._p = event_ptr
-    else            self.event = lv.lv_event(event_ptr)
-    end
+    # A fresh instance per dispatch, not a shared/reused one: dispatch can
+    # re-enter (a handler here can synchronously trigger LVGL events whose
+    # dispatch calls back into this same method before the outer call has
+    # returned - e.g. LV_EVENT_CHILD_CREATED, which bubbles unconditionally
+    # to every ancestor regardless of LV_OBJ_FLAG_EVENT_BUBBLE). Reusing one
+    # instance and mutating its `_p` in place let an inner call repoint the
+    # outer call's still-live `event` out from under it.
+    var event = lv.lv_event(event_ptr)
 
-    var user_data = self.event.get_user_data()            # it is supposed to be a pointer to the object
+    var user_data = event.get_user_data()            # it is supposed to be a pointer to the object
     if int(user_data) != 0
       var target_lvh_obj = introspect.fromptr(user_data)
       if type(target_lvh_obj) == 'instance'
-        # print("CB Fired", self.event.code, target_lvh_obj)
-        target_lvh_obj.event_cb(self.event)
+        # print("CB Fired", event.code, target_lvh_obj)
+        target_lvh_obj.event_cb(event)
         # print("CB Fired After")
       end
     end
