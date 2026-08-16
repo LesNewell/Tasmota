@@ -67,10 +67,23 @@
                               adding a future variant means writing one new handler class and
                               adding it to kProtocolHandlers, not editing switch statements or
                               hunting for loose constants scattered throughout this file.
+  0.0.0.2 20260815  fix     - query-only Power/Mode/Temp/Level/Auto commands (value omitted) used
+                              to reply with a generic "Done"/"queued" ack, same as a set - the
+                              actual cached value only went out on the side-channel MQTT status
+                              topic, not in the command's own response. Now answered directly via
+                              a new HeaterProtocolHandler::queryValue on each protocol class (e.g.
+                              DieselHeaterMode <mac> now replies "Temperature" instead of "Done"),
+                              "unsupported" for combinations that aren't meaningful right now (see
+                              file header "Not every function is meaningful for every protocol") -
+                              see DHQueryOrSet.
 */
 
 /*
-Commands (all Tasmota-style: omit the value to query current setting):
+Commands (all Tasmota-style: omit the value to query current setting - the command's own JSON
+response then echoes that one cached field, e.g. DieselHeaterMode <mac> replies
+{"DieselHeaterMode":"Temperature"} instead of the generic {"DieselHeaterMode":"Done"} a set
+gets - see HeaterProtocolHandler::queryValue/DHQueryOrSet. Still publishes the usual full status
+to stat/.../DieselHeater/<mac> either way, same as any completed op - see "Responses" below):
 
 DieselHeaterPeriod [n]              - polling period in seconds (0 = off).
                                        Default: device's configured TelePeriod.
@@ -335,6 +348,19 @@ class HeaterProtocolHandler {
   // Tasmota Response buffer - see DHPublish.
   virtual void appendStatusFields() const = 0;
 
+  // "RunningMode" as shown in appendStatusFields' JSON ("Level"/"Temperature"/"Ventilation"/
+  // "Off") - factored out so DHQueryOrSet's DHCMD_MODE query (see queryValue) can reuse the exact
+  // same mapping rather than duplicating it.
+  virtual const char *modeText() const = 0;
+
+  // Formats this device's cached value for a query-only command (no value given on the command
+  // line) into buf, for the immediate command response - see DHQueryOrSet. Returns false if this
+  // field isn't meaningful right now (e.g. AutoStartStop on an unencrypted AA55/AA66, or Temp/
+  // Level when the heater isn't currently in that mode) rather than returning a stale/meaningless
+  // value - callers render false as "unsupported", matching this file's documented convention
+  // (see file header "Not every function is meaningful for every protocol").
+  virtual bool queryValue(uint8_t cmd, char *buf, uint8_t bufSize) const = 0;
+
   // A handful of fields the web status page shows generically across every protocol - see
   // DieselHeaterShow. Kept separate from appendStatusFields (which emits full protocol-specific
   // JSON) since the web summary only ever wants these four, in a fixed compact layout.
@@ -484,12 +510,41 @@ class AA55FamilyHandler : public HeaterProtocolHandler {
     }
   }
 
+  const char *modeText() const override { return (0x02 == runningMode) ? "Temperature" : "Level"; }
+
+  // See HeaterProtocolHandler::queryValue. Temp is only meaningful in Temperature mode (matches
+  // the same 0x02 gate appendStatusFields uses for "SetTemp"); Level and AutoStartStop follow
+  // appendStatusFields' own gating ("SetLevel" is unconditional here, "AutoStartStop" only for
+  // the encrypted variants, which are the only ones that report it at all).
+  bool queryValue(uint8_t cmd, char *buf, uint8_t bufSize) const override {
+    switch (cmd) {
+      case DHCMD_POWER:
+        snprintf_P(buf, bufSize, PSTR("%s"), runningState ? "ON" : "OFF");
+        return true;
+      case DHCMD_MODE:
+        snprintf_P(buf, bufSize, PSTR("%s"), modeText());
+        return true;
+      case DHCMD_TEMP:
+        if (0x02 != runningMode) return false;
+        snprintf_P(buf, bufSize, PSTR("%d"), setTemp);
+        return true;
+      case DHCMD_LEVEL:
+        snprintf_P(buf, bufSize, PSTR("%d"), setLevel);
+        return true;
+      case DHCMD_AUTO:
+        if (!hasExtras) return false;
+        snprintf_P(buf, bufSize, PSTR("%s"), isAuto ? "ON" : "OFF");
+        return true;
+      default:
+        return false;
+    }
+  }
+
   void appendStatusFields() const override {
     char fbuf[16];
     ResponseAppend_P(PSTR(",\"RunningState\":%d"), runningState);
     ResponseAppend_P(PSTR(",\"RunningStep\":%d"), runningStep);
-    ResponseAppend_P(PSTR(",\"RunningMode\":\"%s\""),
-      (0x02 == runningMode) ? "Temperature" : "Level");
+    ResponseAppend_P(PSTR(",\"RunningMode\":\"%s\""), modeText());
     if (0x02 == runningMode) {
       ResponseAppend_P(PSTR(",\"SetTemp\":%d"), setTemp);
     }
@@ -787,12 +842,43 @@ class HcaloryHandlerBase : public HeaterProtocolHandler {
     }
   }
 
+  const char *modeText() const override {
+    return (0x1 == setMode) ? "Temperature" : (0x2 == setMode) ? "Level" : (0x3 == setMode) ? "Ventilation" : "Off";
+  }
+
+  // See HeaterProtocolHandler::queryValue. Temp/Level gating mirrors appendStatusFields'
+  // setValueNone/setMode checks exactly (Level covers both the Level and Ventilation setModes,
+  // same as appendStatusFields' "else" branch) - AutoStartStop is always meaningful on Hcalory,
+  // unlike AA55Family, so it's never "unsupported" here.
+  bool queryValue(uint8_t cmd, char *buf, uint8_t bufSize) const override {
+    switch (cmd) {
+      case DHCMD_POWER:
+        snprintf_P(buf, bufSize, PSTR("%s"), runningState ? "ON" : "OFF");
+        return true;
+      case DHCMD_MODE:
+        snprintf_P(buf, bufSize, PSTR("%s"), modeText());
+        return true;
+      case DHCMD_TEMP:
+        if (setValueNone || 0x1 != setMode) return false;
+        snprintf_P(buf, bufSize, PSTR("%d"), setTemp);
+        return true;
+      case DHCMD_LEVEL:
+        if (setValueNone || 0x1 == setMode) return false;
+        snprintf_P(buf, bufSize, PSTR("%d"), setLevel);
+        return true;
+      case DHCMD_AUTO:
+        snprintf_P(buf, bufSize, PSTR("%s"), autoStartStop ? "ON" : "OFF");
+        return true;
+      default:
+        return false;
+    }
+  }
+
   void appendStatusFields() const override {
     char fbuf[16];
     ResponseAppend_P(PSTR(",\"RunningState\":%d"), runningState);
     ResponseAppend_P(PSTR(",\"RunningStep\":%d"), runningStep);
-    ResponseAppend_P(PSTR(",\"RunningMode\":\"%s\""),
-      (0x1 == setMode) ? "Temperature" : (0x2 == setMode) ? "Level" : (0x3 == setMode) ? "Ventilation" : "Off");
+    ResponseAppend_P(PSTR(",\"RunningMode\":\"%s\""), modeText());
     if (!setValueNone) {
       if (0x1 == setMode) {
         ResponseAppend_P(PSTR(",\"SetTemp\":%d"), setTemp);
@@ -1463,7 +1549,7 @@ void DieselHeaterEverySecond(void) {
  * a wire read (see file header "Caching" note). Only DieselHeaterState forces a fresh read.
 \*********************************************************************************************/
 
-const char *responses[] = { PSTR("Done"), PSTR("queued"), PSTR("invaddr"), PSTR("nostate") };
+const char *responses[] = { PSTR("Done"), PSTR("queued"), PSTR("invaddr"), PSTR("nostate"), PSTR("unsupported") };
 
 bool DHParseMac(uint8_t *addrbin, char **rest) {
   char *p = strtok(XdrvMailbox.data, " ");
@@ -1532,10 +1618,18 @@ void DHQueryOrSet(uint8_t cmd, int (*parseArg)(const char *)) {
   HeaterProtocolHandler *device = findOrRegisterDevice(addrbin);
 
   if (!rest || !rest[0]) {
-    // query - answer from cache only, never touch the wire
+    // query - answer from cache only, never touch the wire. DHPublish still sends the full
+    // status JSON to the usual stat/.../DieselHeater/<mac> topic (as any op completion would);
+    // the command's own response below is just this one field, e.g. DieselHeaterMode <mac> with
+    // no value replies with the current mode instead of a generic "Done" - see queryValue.
     if (!device || !device->stateValid) { ResponseCmndChar(responses[3]); return; }
     DHPublish(addrbin, cmdnames[cmd], true);
-    ResponseCmndChar(responses[0]);
+    char valbuf[16];
+    if (device->queryValue(cmd, valbuf, sizeof(valbuf))) {
+      ResponseCmndChar(valbuf);
+    } else {
+      ResponseCmndChar(responses[4]);
+    }
     return;
   }
 
