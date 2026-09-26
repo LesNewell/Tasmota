@@ -497,6 +497,17 @@ uint64_t BLELastLoopTime = 0;
 int BLEScanTimeS = 20; // scan duraiton in S
 int BLEMaxTimeBetweenAdverts = 120; // we expect an advert at least this frequently, else restart BLE (in S)
 uint64_t BLEScanLastAdvertismentAt = 0;
+// BLEScanLastAdvertismentAt is also reset whenever an operation starts, so a device polled
+// regularly keeps it from ever timing out. This one is only updated by received adverts.
+int BLEMaxTimeWithoutAdverts = 300; // restart BLE if scanning but no advert received at all (in S)
+uint64_t BLELastAdvertReceivedAt = 0;
+#if CONFIG_IDF_TARGET_ESP32P4
+bool BLEHostedControllerInited = false;
+bool BLEHostedControllerEnabled = false;
+uint8_t BLEResetHostedController = 0;       // ask the BLE task to reset the co-processor's BT controller
+uint8_t BLEHostedControllerResets = 0;      // resets since adverts were last received
+uint64_t BLEHostedControllerResetAt = 0;
+#endif
 uint32_t lastopid = 0; // incrementing uinique opid
 uint32_t BLEResets = 0;
 // controls request of details about one device
@@ -558,7 +569,11 @@ int minRSSI = -100;
 #define D_CMND_BLE "BLE"
 
 const char kBLE_Commands[] PROGMEM = D_CMND_BLE "|"
-  "Period|Adv|Op|Mode|Details|Scan|Alias|Name|Debug|Devices|MaxAge|AddrFilter|EnableUnsaved|FilterNames|MinRssiLevel|Pair";
+  "Period|Adv|Op|Mode|Details|Scan|Alias|Name|Debug|Devices|MaxAge|AddrFilter|EnableUnsaved|FilterNames|MinRssiLevel|Pair"
+#if CONFIG_IDF_TARGET_ESP32P4
+  "|Hosted"
+#endif
+  ;
 
 static void CmndBLEPeriod(void);
 static void CmndBLEAdv(void);
@@ -576,6 +591,9 @@ static void CmndBLEEnableUnsaved(void);
 static void CmndBleFilterNames(void);
 static void CmndSetMinRSSI(void);
 static void CmndPair(void);
+#if CONFIG_IDF_TARGET_ESP32P4
+static void CmndBLEHosted(void);
+#endif
 
 void (*const BLE_Commands[])(void) PROGMEM = {
   &BLE_ESP32::CmndBLEPeriod,
@@ -593,7 +611,10 @@ void (*const BLE_Commands[])(void) PROGMEM = {
   &BLE_ESP32::CmndBLEEnableUnsaved,
   &BLE_ESP32::CmndBleFilterNames,
   &BLE_ESP32::CmndSetMinRSSI,
-  &BLE_ESP32::CmndPair
+  &BLE_ESP32::CmndPair,
+#if CONFIG_IDF_TARGET_ESP32P4
+  &BLE_ESP32::CmndBLEHosted,
+#endif
 };
 
 const char *successStates[] PROGMEM = {
@@ -692,10 +713,12 @@ const char *BLE_RESTART_TEAMOTA_REASON_UNKNOWN = PSTR("unknown");
 const char *BLE_RESTART_TEAMOTA_REASON_RESTARTING_BLE_TIMEOUT = PSTR("restarting BLE took > 5s");
 const char *BLE_RESTART_TEAMOTA_REASON_BLE_LOOP_STALLED = PSTR("BLE loop stalled > 120s");
 const char *BLE_RESTART_TEAMOTA_REASON_BLE_DISCONNECT_FAIL = PSTR("BLE disconnect taking > 60s");
+const char *BLE_RESTART_TEAMOTA_REASON_NO_ADVERTS = PSTR("no adverts after BT controller reset");
 const char *BLERestartTasmotaReason = BLE_RESTART_TEAMOTA_REASON_UNKNOWN;
 
 const char *BLE_RESTART_BLE_REASON_UNKNOWN = PSTR("unknown");
 const char *BLE_RESTART_BLE_REASON_ADVERT_BLE_TIMEOUT = PSTR("no adverts in 120s");
+const char *BLE_RESTART_BLE_REASON_NO_ADVERTS_RECEIVED = PSTR("no adverts received in 300s");
 const char *BLE_RESTART_BLE_REASON_CONN_LIMIT = PSTR("connect failed with connection limit reached");
 const char *BLE_RESTART_BLE_REASON_CONN_EXISTS = PSTR("connect failed with connection exists");
 const char *BLERestartBLEReason = nullptr;
@@ -1599,6 +1622,7 @@ class BLEAdvCallbacks: public NimBLEScanCallbacks {
     TasAutoMutex localmutex(&BLEOperationsRecursiveMutex, "BLEAddCB");
     uint64_t now = esp_timer_get_time();
     BLEScanLastAdvertismentAt = now; // note the time of the last advertisment
+    BLELastAdvertReceivedAt = now;
 
     uint32_t totalCount = BLEAdvertisment.totalCount;
     memset(&BLEAdvertisment, 0, sizeof(BLEAdvertisment));
@@ -1895,6 +1919,7 @@ static void BLEInit(void) {
 
   uint64_t now = esp_timer_get_time();
   BLEScanLastAdvertismentAt = now; // initialise the time of the last advertisment
+  BLELastAdvertReceivedAt = now;
   BLELastLoopTime = now;
 
   BLEInitState = 1;
@@ -1931,6 +1956,30 @@ static void BLEStartOperationTask(){
 }
 
 
+#if CONFIG_IDF_TARGET_ESP32P4
+// Reset the BT controller on the co-processor under the running NimBLE host,
+// then have the host resync with it (this also ends any scan it thinks is running).
+static void BLEHostedControllerReset(void){
+  AddLog(LOG_LEVEL_ERROR, PSTR("BLE: resetting hosted BT controller"));
+  esp_err_t err;
+  if (ESP_OK != (err = esp_hosted_bt_controller_disable())){
+    AddLog(LOG_LEVEL_ERROR, PSTR("BLE: hosted BT controller disable failed %d"), err);
+  }
+  if (ESP_OK != (err = esp_hosted_bt_controller_deinit(false))){
+    AddLog(LOG_LEVEL_ERROR, PSTR("BLE: hosted BT controller deinit failed %d"), err);
+  }
+  if (ESP_OK != (err = esp_hosted_bt_controller_init())){
+    AddLog(LOG_LEVEL_ERROR, PSTR("BLE: hosted BT controller init failed %d"), err);
+  }
+  if (ESP_OK != (err = esp_hosted_bt_controller_enable())){
+    AddLog(LOG_LEVEL_ERROR, PSTR("BLE: hosted BT controller enable failed %d"), err);
+  }
+  BLEHostedControllerInited = true;
+  BLEHostedControllerEnabled = true;
+  ble_hs_sched_reset(BLE_HS_ECONTROLLER);
+}
+#endif
+
 static void BLETaskStopStartNimBLE(NimBLEClient **ppClient, bool start = true){
 
   if (*ppClient){
@@ -1965,15 +2014,17 @@ static void BLETaskStopStartNimBLE(NimBLEClient **ppClient, bool start = true){
   if (start){
 #if CONFIG_IDF_TARGET_ESP32P4
     // one-time bring-up of the co-processor's BT controller (see include comment above)
-    static bool hostedBtControllerReady = false;
-    if (!hostedBtControllerReady){
+    if (!BLEHostedControllerInited){
       if (ESP_OK != esp_hosted_bt_controller_init()){
         AddLog(LOG_LEVEL_ERROR, PSTR("BLE: failed to init hosted BT controller"));
       }
+      BLEHostedControllerInited = true;
+    }
+    if (!BLEHostedControllerEnabled){
       if (ESP_OK != esp_hosted_bt_controller_enable()){
         AddLog(LOG_LEVEL_ERROR, PSTR("BLE: failed to enable hosted BT controller"));
       }
-      hostedBtControllerReady = true;
+      BLEHostedControllerEnabled = true;
     }
 #endif
     AddLog(LOG_LEVEL_INFO, PSTR("BLE: BLETask: Starting NimBLE"));
@@ -2008,6 +2059,7 @@ static void BLETaskStopStartNimBLE(NimBLEClient **ppClient, bool start = true){
   // don't restart because of these for a while
   BLELastLoopTime = now; // initialise the time of the last advertisment
   BLEScanLastAdvertismentAt = now; // initialise the time of the last advertisment
+  BLELastAdvertReceivedAt = now;
 
 }
 
@@ -2574,6 +2626,14 @@ static void BLEOperationTask(void *pvParameters){
     if (BLEStop == 1){
       break;
     }
+
+#if CONFIG_IDF_TARGET_ESP32P4
+    if (BLEResetHostedController){
+      BLEResetHostedController = 0;
+      BLEHostedControllerReset();
+      BLEResets++;
+    }
+#endif
 
     if (BLERestartNimBLE){
       BLERestartNimBLE = 0;
@@ -3343,6 +3403,30 @@ void CmndBleFilterNames(void) {
 #endif
 }
 
+#if CONFIG_IDF_TARGET_ESP32P4
+// BLEHosted   - show the co-processor BT controller state
+// BLEHosted 0 - disable the controller under the running NimBLE host (simulates a dead controller)
+// BLEHosted 1 - enable it again
+// BLEHosted 2 - reset it (disable, deinit, init, enable), as done on a scan stall
+void CmndBLEHosted(void) {
+  if ((2 == XdrvMailbox.payload) && BLEHostedControllerInited) {
+    BLEResetHostedController = 1;        // done by the BLE task
+    ResponseCmndDone();
+    return;
+  }
+  if ((XdrvMailbox.data_len > 0) && BLEHostedControllerInited) {
+    bool enable = XdrvMailbox.payload;
+    esp_err_t err = enable ? esp_hosted_bt_controller_enable() : esp_hosted_bt_controller_disable();
+    if (ESP_OK == err) {
+      BLEHostedControllerEnabled = enable;
+    } else {
+      AddLog(LOG_LEVEL_ERROR, PSTR("BLE: hosted BT controller %s failed %d"), enable ? "enable" : "disable", err);
+    }
+  }
+  ResponseCmndStateText(BLEHostedControllerEnabled);
+}
+#endif
+
 void CmndSetMinRSSI(void) {
 #ifdef BLE_ESP32_FILTER_BY_RSSI  
   if (XdrvMailbox.data_len) {
@@ -3776,6 +3860,7 @@ static void mainThreadBLETimeouts() {
   if (!BLERunning){
     BLELastLoopTime = now; // initialise the time of the last advertisment
     BLEScanLastAdvertismentAt = now; // initialise the time of the last advertisment
+    BLELastAdvertReceivedAt = now;
     return;
   }
 
@@ -3799,6 +3884,39 @@ static void mainThreadBLETimeouts() {
 
     BLERestartBLEReason = BLE_RESTART_BLE_REASON_ADVERT_BLE_TIMEOUT;
   }
+
+  // the check above never fires while operations keep starting, so also check
+  // that adverts are actually arriving when we should be scanning
+  uint64_t noAdvertTimeout = ((uint64_t)BLEMaxTimeWithoutAdverts)*1000L*1000L;
+  if ((BLEMode == BLEModeRegularScan) && (BLELastAdvertReceivedAt + noAdvertTimeout < now)){
+    BLELastAdvertReceivedAt = now;
+    BLEScanLastAdvertismentAt = now;
+#if CONFIG_IDF_TARGET_ESP32P4
+    // Restarting NimBLE can crash while the host is trying to resync with a dead
+    // controller (ble_hs_reset() racing nimble_port_deinit()). Reset just the
+    // co-processor's controller instead; the running host resyncs with it.
+    if (!BLEHostedControllerResets){
+      AddLog(LOG_LEVEL_ERROR, PSTR("BLE: Scan stall? no adverts received > %ds, reset BT controller"), BLEMaxTimeWithoutAdverts);
+      BLEHostedControllerResets++;
+      BLEHostedControllerResetAt = now;
+      BLEResetHostedController = 1;
+    } else {
+      AddLog(LOG_LEVEL_ERROR, PSTR("BLE: still no adverts after BT controller reset"));
+      BLERestartTasmota = 10;
+      BLERestartTasmotaReason = BLE_RESTART_TEAMOTA_REASON_NO_ADVERTS;
+    }
+#else
+    BLERestartNimBLE = 1;
+    AddLog(LOG_LEVEL_ERROR, PSTR("BLE: Scan stall? no adverts received > %ds, restart BLE"), BLEMaxTimeWithoutAdverts);
+    BLERestartBLEReason = BLE_RESTART_BLE_REASON_NO_ADVERTS_RECEIVED;
+#endif
+  }
+#if CONFIG_IDF_TARGET_ESP32P4
+  if (BLEHostedControllerResets && (BLELastAdvertReceivedAt > BLEHostedControllerResetAt)){
+    AddLog(LOG_LEVEL_INFO, PSTR("BLE: adverts received again after BT controller reset"));
+    BLEHostedControllerResets = 0;
+  }
+#endif
 
   // if stuck and have not done task for 120s, something is seriously wrong.
   // restart Tasmota completely. (belt and braces)
