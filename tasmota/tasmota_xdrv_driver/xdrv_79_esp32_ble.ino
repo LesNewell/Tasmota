@@ -2007,6 +2007,13 @@ static void BLETaskStopStartNimBLE(NimBLEClient **ppClient, bool start = true){
 
     // wait second
     vTaskDelay(100/ portTICK_PERIOD_MS);
+#if CONFIG_IDF_TARGET_ESP32P4
+    if (!ble_hs_synced()){
+      // The host is busy trying to resync with a dead controller; nimble_port_deinit()
+      // would free its timer under it (Load access fault in ble_hs_timer_sched)
+      AddLog(LOG_LEVEL_ERROR, PSTR("BLE: host not synced, skipping NimBLE deinit"));
+    } else
+#endif
     NimBLEDevice::deinit(true);
   }
   BLERunningScan = 0;
