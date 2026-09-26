@@ -383,8 +383,14 @@ void WifiBegin(uint8_t flag, uint8_t channel) {
 #endif  // USE_WIFI_RANGE_EXTENDER
 
   WifiMDNSBeforeDisconnect();
-  
+
+#ifdef CONFIG_ESP_WIFI_REMOTE_ENABLED
+  // Turning wifi off on the hosted co-processor also takes down its BT controller,
+  // leaving BLE dead until that is reset. Only drop the association.
+  WiFi.disconnect(false);
+#else
   WiFi.disconnect(true);  // Delete SDK wifi config
+#endif
   delay(200);
   WifiSetMode(WIFI_STA);  // Disable AP mode
 #ifdef USE_WIFI_RANGE_EXTENDER
