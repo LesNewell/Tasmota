@@ -18,13 +18,25 @@ bool uDisplay::utouch_Init(char **name) {
   
   if (ut_init_code) {
     if (ut_reset >= 0) {
+      // Goodix GT9xx latch their I2C address from INT on reset release (low = 0x5D, high = 0x14)
+      bool goodix = ut_wire && (ut_irq >= 0) && ((0x5D == ut_i2caddr) || (0x14 == ut_i2caddr));
       pinMode(ut_reset, OUTPUT);
       digitalWrite(ut_reset, HIGH);
       delay(10);
       digitalWrite(ut_reset, LOW);
+      if (goodix) {
+        pinMode(ut_irq, OUTPUT);
+        digitalWrite(ut_irq, (0x14 == ut_i2caddr) ? HIGH : LOW);
+      }
       delay(10);
       digitalWrite(ut_reset, HIGH);
-      delay(50);
+      if (goodix) {
+        delay(5);                   // Hold INT until the address is latched
+        pinMode(ut_irq, INPUT);
+        delay(60);                  // Not responding for ~50ms after reset
+      } else {
+        delay(50);
+      }
     }
     
     if (ut_irq >= 0) {
